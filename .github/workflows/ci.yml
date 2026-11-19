@@ -69,8 +69,8 @@ jobs:
           original = catalog.read_text(encoding="utf-8")
           updated = original
 
-          compile_sdk_match = re.search(r'(?m)^compileSdk\\s*=\\s*"?(\\d+)"?\\s*$', updated)
-          agp_match = re.search(r'(?m)^agp\\s*=\\s*"([^"]+)"', updated)
+          compile_sdk_match = re.search(r'(?m)^compileSdk\s*=\s*"?(\d+)"?\s*$', updated)
+          agp_match = re.search(r'(?m)^agp\s*=\s*"([^"]+)"', updated)
 
           if not compile_sdk_match or not agp_match:
               raise SystemExit("Could not safely identify compileSdk or AGP in the version catalog.")
@@ -79,15 +79,15 @@ jobs:
           agp_version = agp_match.group(1)
 
           def version_tuple(value):
-              numbers = re.findall(r'\\d+', value)
+              numbers = re.findall(r'\d+', value)
               return tuple(int(part) for part in numbers[:3])
 
           # AGP 8.9.x does not support compiling against Android API 36.
           # Upgrade only older AGP versions; leave already newer versions untouched.
           if compile_sdk >= 36 and version_tuple(agp_version) < (8, 10, 0):
               updated = re.sub(
-                  r'(?m)^(agp\\s*=\\s*")[^"]+(")',
-                  r'\\g<1>8.10.1\\2',
+                  r'(?m)^(agp\s*=\s*")[^"]+(")',
+                  r'\g<1>8.10.1\\2',
                   updated,
                   count=1
               )
@@ -102,7 +102,7 @@ jobs:
 
           changed = updated != original or (mode & stat.S_IXUSR) == 0
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"changed={'true' if changed else 'false'}\\n")
+              output.write(f"changed={'true' if changed else 'false'}\n")
 
           print("Known configuration checks and repairs completed.")
           PY
