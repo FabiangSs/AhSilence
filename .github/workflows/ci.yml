@@ -119,14 +119,14 @@ jobs:
 
           # Kotlin 2.0.21 cannot read Kotlin 2.2 metadata shipped by
           # kotlinx-coroutines 1.11.x / newer AndroidX artifacts.
-          kotlin_match = re.search(r'(?m)^kotlin\\s*=\\s*"([^"]+)"', updated)
-          coroutines_match = re.search(r'(?m)^coroutines\\s*=\\s*"([^"]+)"', updated)
+          kotlin_match = re.search(r'(?m)^kotlin\s*=\s*"([^"]+)"', updated)
+          coroutines_match = re.search(r'(?m)^coroutines\s*=\s*"([^"]+)"', updated)
           if kotlin_match and coroutines_match:
               kotlin_version = kotlin_match.group(1)
               coroutines_version = coroutines_match.group(1)
               if version_tuple(kotlin_version) < (2, 2, 20) and version_tuple(coroutines_version) >= (1, 11, 0):
                   updated = re.sub(
-                      r'(?m)^(kotlin\\s*=\\s*)"[^"]+"',
+                      r'(?m)^(kotlin\s*=\s*)"[^"]+"',
                       lambda match: match.group(1) + '"2.2.20"',
                       updated,
                       count=1
