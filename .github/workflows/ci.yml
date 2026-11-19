@@ -1,4 +1,4 @@
-name: AhSilence - Auto Repair and Android Build
+name: AhSilence - Auto Repair, Build and Diagnostics
 
 on:
   push:
@@ -15,41 +15,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  repair-and-build:
-    name: Repair configuration, build APK, test and lint
-    # Prevent an automatic repair commit from starting an endless workflow loop.
+  build-and-diagnose:
+    name: Repair, compile, test and report
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
-      - name: Check out source
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           persist-credentials: true
 
       - name: Set up Java 21
+        id: java
+        continue-on-error: true
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK tools
+        id: android
+        continue-on-error: true
         uses: android-actions/setup-android@v4
         with:
           accept-android-sdk-licenses: true
 
-      - name: Install Android SDK, NDK and CMake
+      - name: Install required Android SDK packages
+        id: sdk
+        shell: bash
+        continue-on-error: true
         run: |
+          set +e
           sdkmanager --install \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;27.1.12297006" \
-            "cmake;3.22.1"
+            "cmake;3.22.1" > android-sdk.log 2>&1
+          rc=$?
+          cat android-sdk.log
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
 
-      - name: Automatically repair known build configuration issues
+      - name: Repair known build configuration automatically
         id: repair
+        continue-on-error: true
         shell: bash
         run: |
           python3 <<'PY'
@@ -60,7 +72,6 @@ jobs:
 
           catalog = Path("gradle/libs.versions.toml")
           wrapper = Path("gradlew")
-
           if not catalog.is_file():
               raise SystemExit("Missing gradle/libs.versions.toml")
           if not wrapper.is_file():
@@ -68,72 +79,280 @@ jobs:
 
           original = catalog.read_text(encoding="utf-8")
           updated = original
-
-          compile_sdk_match = re.search(r'(?m)^compileSdk\s*=\s*"?(\d+)"?\s*$', updated)
+          sdk_match = re.search(r'(?m)^compileSdk\s*=\s*"?([0-9]+)"?\s*$', updated)
           agp_match = re.search(r'(?m)^agp\s*=\s*"([^"]+)"', updated)
+          if not sdk_match or not agp_match:
+              raise SystemExit("Could not read compileSdk and AGP from the version catalog")
 
-          if not compile_sdk_match or not agp_match:
-              raise SystemExit("Could not safely identify compileSdk or AGP in the version catalog.")
-
-          compile_sdk = int(compile_sdk_match.group(1))
+          compile_sdk = int(sdk_match.group(1))
           agp_version = agp_match.group(1)
 
           def version_tuple(value):
-              numbers = re.findall(r'\d+', value)
-              return tuple(int(part) for part in numbers[:3])
+              return tuple(int(part) for part in re.findall(r'\d+', value)[:3])
 
-          # AGP 8.9.x does not support compiling against Android API 36.
-          # Upgrade only older AGP versions; leave already newer versions untouched.
-          if compile_sdk >= 36 and version_tuple(agp_version) < (8, 10, 0):
+          if compile_sdk == 36 and version_tuple(agp_version) < (8, 10, 1):
               updated = re.sub(
-                  r'(?m)^(agp\s*=\s*")[^"]+(")',
-                  r'\g<1>8.10.1\\2',
+                  r'(?m)^(agp\s*=\s*)"[^"]+"',
+                  lambda match: match.group(1) + '"8.10.1"',
                   updated,
                   count=1
               )
-              print(f"Updated Android Gradle Plugin {agp_version} -> 8.10.1 for compileSdk {compile_sdk}.")
+              print(f"Repaired AGP {agp_version} -> 8.10.1 for compileSdk 36.")
+
+          lifecycle_match = re.search(
+              r'(?m)^lifecycleRuntimeKtx\s*=\s*"([^"]+)"',
+              updated
+          )
+          if (
+              compile_sdk == 36
+              and lifecycle_match
+              and version_tuple(lifecycle_match.group(1)) >= (2, 11, 0)
+          ):
+              old_version = lifecycle_match.group(1)
+              updated = re.sub(
+                  r'(?m)^(lifecycleRuntimeKtx\s*=\s*)"[^"]+"',
+                  lambda match: match.group(1) + '"2.10.0"',
+                  updated,
+                  count=1
+              )
+              print(f"Repaired lifecycleRuntimeKtx {old_version} -> 2.10.0 for API 36.")
 
           if updated != original:
               catalog.write_text(updated, encoding="utf-8")
 
-          # The repository's wrapper may lose its executable bit on checkout.
-          mode = wrapper.stat().st_mode
-          wrapper.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+          old_mode = wrapper.stat().st_mode
+          wrapper.chmod(old_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+          wrapper_was_not_executable = not bool(old_mode & stat.S_IXUSR)
+          changed = (updated != original) or wrapper_was_not_executable
 
-          changed = updated != original or (mode & stat.S_IXUSR) == 0
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"changed={'true' if changed else 'false'}\n")
-
-          print("Known configuration checks and repairs completed.")
+          print("Configuration checks completed.")
           PY
 
-      - name: Set up Gradle
+      - name: Set up Gradle cache
+        id: gradle_setup
+        continue-on-error: true
         uses: gradle/actions/setup-gradle@v4
 
       - name: Verify Gradle wrapper
-        run: ./gradlew --version
+        id: wrapper
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          ./gradlew --version > wrapper.log 2>&1
+          rc=$?
+          cat wrapper.log
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Build installable Debug APK
         id: build
+        shell: bash
         run: |
-          set -o pipefail
-          ./gradlew --no-daemon --stacktrace clean assembleDebug 2>&1 | tee build.log
+          set +e
+          ./gradlew --no-daemon --console=plain --stacktrace --warning-mode=all clean assembleDebug > build.log 2>&1
+          rc=$?
+          cat build.log
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
 
-      - name: Run unit tests
+      - name: Run unit tests even when APK compilation fails
         id: tests
-        if: always() && steps.build.outcome == 'success'
+        if: always()
+        shell: bash
         run: |
-          set -o pipefail
-          ./gradlew --no-daemon --stacktrace test 2>&1 | tee -a build.log
+          set +e
+          ./gradlew --no-daemon --console=plain --stacktrace --warning-mode=all test > test.log 2>&1
+          rc=$?
+          cat test.log
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
 
-      - name: Run Android lint
+      - name: Run Android lint even when another task fails
         id: lint
-        if: always() && steps.build.outcome == 'success'
+        if: always()
+        shell: bash
         run: |
-          set -o pipefail
-          ./gradlew --no-daemon --stacktrace lint 2>&1 | tee -a build.log
+          set +e
+          ./gradlew --no-daemon --console=plain --stacktrace --warning-mode=all lint > lint.log 2>&1
+          rc=$?
+          cat lint.log
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
 
-      - name: Save known repairs back to the branch
+      - name: Generate exact failure report
+        id: report
+        if: always()
+        shell: bash
+        env:
+          JAVA_OUTCOME: ${{ steps.java.outcome }}
+          ANDROID_OUTCOME: ${{ steps.android.outcome }}
+          SDK_OUTCOME: ${{ steps.sdk.outcome }}
+          SDK_RC: ${{ steps.sdk.outputs.exit_code }}
+          REPAIR_OUTCOME: ${{ steps.repair.outcome }}
+          GRADLE_SETUP_OUTCOME: ${{ steps.gradle_setup.outcome }}
+          WRAPPER_OUTCOME: ${{ steps.wrapper.outcome }}
+          WRAPPER_RC: ${{ steps.wrapper.outputs.exit_code }}
+          BUILD_RC: ${{ steps.build.outputs.exit_code }}
+          TEST_RC: ${{ steps.tests.outputs.exit_code }}
+          LINT_RC: ${{ steps.lint.outputs.exit_code }}
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import glob
+          import xml.etree.ElementTree as ET
+
+          env = os.environ
+          statuses = [
+              ("Java 21", env.get("JAVA_OUTCOME", "unknown")),
+              ("Android SDK setup", env.get("ANDROID_OUTCOME", "unknown")),
+              ("SDK / NDK / CMake", f"{env.get('SDK_OUTCOME', 'unknown')} (exit {env.get('SDK_RC', 'n/a')})"),
+              ("Automatic repairs", env.get("REPAIR_OUTCOME", "unknown")),
+              ("Gradle cache setup", env.get("GRADLE_SETUP_OUTCOME", "unknown")),
+              ("Gradle wrapper", f"{env.get('WRAPPER_OUTCOME', 'unknown')} (exit {env.get('WRAPPER_RC', 'n/a')})"),
+              ("assembleDebug", f"exit {env.get('BUILD_RC', 'not run')}"),
+              ("unit tests", f"exit {env.get('TEST_RC', 'not run')}"),
+              ("lint", f"exit {env.get('LINT_RC', 'not run')}"),
+          ]
+
+          lines = [
+              "# AhSilence - informe de compilación",
+              "",
+              f"- Repositorio: {env.get('GITHUB_REPOSITORY', 'unknown')}",
+              f"- Rama: {env.get('GITHUB_REF_NAME', 'unknown')}",
+              f"- Commit: {env.get('GITHUB_SHA', 'unknown')}",
+              f"- Ejecución: https://github.com/{env.get('GITHUB_REPOSITORY', '')}/actions/runs/{env.get('GITHUB_RUN_ID', '')}",
+              "",
+              "## Resultado por etapa",
+              "",
+              "| Etapa | Resultado |",
+              "|---|---|",
+          ]
+          for name, status in statuses:
+              lines.append(f"| {name} | {status} |")
+
+          log_files = [
+              ("Instalación Android SDK", "android-sdk.log"),
+              ("Verificación Gradle", "wrapper.log"),
+              ("Compilación APK", "build.log"),
+              ("Pruebas unitarias", "test.log"),
+              ("Lint", "lint.log"),
+          ]
+          error_patterns = re.compile(
+              r"FAILURE:|Execution failed for task|error:|(^|\\s)e: |"
+              r"Caused by:|Could not resolve|Could not find|"
+              r"No matching variant|requires .* (or later|and higher)|"
+              r"NDK .* (not found|missing)|CMake .* (not found|missing)",
+              re.IGNORECASE
+          )
+
+          found_any = False
+          for label, filename in log_files:
+              path = Path(filename)
+              if not path.exists():
+                  continue
+              raw = path.read_text(encoding="utf-8", errors="replace")
+              source_lines = raw.splitlines()
+              blocks = []
+
+              for index, line in enumerate(source_lines):
+                  if "* What went wrong:" in line:
+                      block = []
+                      for item in source_lines[index:index + 90]:
+                          if block and ("* Try:" in item or "* Exception is:" in item):
+                              break
+                          block.append(item)
+                      blocks.append(block)
+
+              if blocks:
+                  found_any = True
+                  lines.extend(["", f"## Error exacto - {label}", ""])
+                  for block in blocks[:3]:
+                      lines.extend(block[:70])
+                      lines.append("")
+              else:
+                  matches = [item for item in source_lines if error_patterns.search(item)]
+                  if matches:
+                      found_any = True
+                      lines.extend(["", f"## Mensajes de error - {label}", ""])
+                      lines.extend(matches[:80])
+                  elif filename == "android-sdk.log" and raw.strip() and env.get("SDK_RC") not in ("0", "", None):
+                      found_any = True
+                      lines.extend(["", f"## Salida de instalación - {label}", ""])
+                      lines.extend(source_lines[-80:])
+
+          junit_failures = []
+          for xml_path in glob.glob("app/build/test-results/**/*.xml", recursive=True):
+              try:
+                  root = ET.parse(xml_path).getroot()
+                  for case in root.iter("testcase"):
+                      for failure in list(case):
+                          if failure.tag in ("failure", "error"):
+                              junit_failures.append(
+                                  f"{case.get('classname', '')}.{case.get('name', '')}: "
+                                  f"{failure.get('message', '')}"
+                              )
+              except (ET.ParseError, OSError):
+                  pass
+
+          if junit_failures:
+              found_any = True
+              lines.extend(["", "## Casos de prueba fallidos", ""])
+              lines.extend(junit_failures[:100])
+
+          apk_files = glob.glob("app/build/outputs/apk/debug/*.apk")
+          lines.extend(["", "## APK generado", ""])
+          if apk_files:
+              for apk in apk_files:
+                  size_mb = Path(apk).stat().st_size / (1024 * 1024)
+                  lines.append(f"- {apk} ({size_mb:.2f} MiB)")
+          else:
+              lines.append("- No se generó ningún APK Debug.")
+
+          lines.extend([
+              "",
+              "## Archivos de diagnóstico",
+              "",
+              "- build.log: salida completa de assembleDebug.",
+              "- test.log: salida completa de las pruebas.",
+              "- lint.log: salida completa de lint.",
+              "- android-sdk.log: instalación del SDK/NDK/CMake.",
+              "- wrapper.log: verificación de Gradle.",
+              "- app/build/reports/: informes Gradle/Lint disponibles.",
+          ])
+
+          report = "\n".join(lines) + "\n"
+          Path("build-diagnostics.md").write_text(report, encoding="utf-8")
+          with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(report)
+
+          print("Diagnostic report generated.")
+          print(f"Recognized error details: {'yes' if found_any else 'none found in captured logs'}")
+          PY
+
+      - name: Upload APK, complete logs and diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AhSilence-build-and-diagnostics
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/reports/
+            app/build/test-results/
+            android-sdk.log
+            wrapper.log
+            build.log
+            test.log
+            lint.log
+            build-diagnostics.md
+          if-no-files-found: warn
+          retention-days: 21
+
+      - name: Save automatic configuration repairs
         if: always() && steps.repair.outputs.changed == 'true' && github.event_name != 'pull_request'
         continue-on-error: true
         env:
@@ -143,21 +362,36 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add gradle/libs.versions.toml gradlew
           if git diff --cached --quiet; then
-            echo "No repository changes to save."
+            echo "No configuration changes to commit."
             exit 0
           fi
           git commit -m "ci: automatically repair Android build configuration"
           git push origin "HEAD:${BRANCH_NAME}"
 
-      - name: Upload APK and build diagnostics
+      - name: Set final workflow result
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: AhSilence-Android-build
-          path: |
-            app/build/outputs/apk/debug/*.apk
-            app/build/reports/lint-results*
-            app/build/test-results/
-            build.log
-          if-no-files-found: warn
-          retention-days: 14
+        shell: bash
+        env:
+          JAVA_OUTCOME: ${{ steps.java.outcome }}
+          ANDROID_OUTCOME: ${{ steps.android.outcome }}
+          SDK_OUTCOME: ${{ steps.sdk.outcome }}
+          SDK_RC: ${{ steps.sdk.outputs.exit_code }}
+          REPAIR_OUTCOME: ${{ steps.repair.outcome }}
+          GRADLE_SETUP_OUTCOME: ${{ steps.gradle_setup.outcome }}
+          WRAPPER_RC: ${{ steps.wrapper.outputs.exit_code }}
+          BUILD_RC: ${{ steps.build.outputs.exit_code }}
+          TEST_RC: ${{ steps.tests.outputs.exit_code }}
+          LINT_RC: ${{ steps.lint.outputs.exit_code }}
+        run: |
+          failed=0
+          for outcome in "$JAVA_OUTCOME" "$ANDROID_OUTCOME" "$SDK_OUTCOME" "$REPAIR_OUTCOME" "$GRADLE_SETUP_OUTCOME"; do
+            [ "$outcome" = "success" ] || failed=1
+          done
+          for code in "$SDK_RC" "$WRAPPER_RC" "$BUILD_RC" "$TEST_RC" "$LINT_RC"; do
+            [ "$code" = "0" ] || failed=1
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "::error title=AhSilence build failed::Review the job summary and download the diagnostics artifact."
+            exit 1
+          fi
+          echo "All build, test and lint stages completed successfully."
